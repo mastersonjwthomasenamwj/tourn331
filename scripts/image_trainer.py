@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""
+Standalone script for image model training (SDXL or Flux)
+"""
+
+import argparse
+import asyncio
+import os
+import subprocess
+import sys
+import hashlib
+import json
+
+import toml
+import random
+
+
+# Add project root to python path to import modules
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+sys.path.append(project_root)
+
+import core.constants as cst
+import trainer.constants as train_cst
+import trainer.utils.training_paths as train_paths
+from core.config.config_handler import save_config_toml
+from core.dataset.prepare_diffusion_dataset import prepare_dataset
+from core.models.utility_models import ImageModelType
+from pathlib import Path
+from trainer.utils.style_detection import detect_styles_in_prompts
+
+
+def apply_reg_ratio_to_lr(value, reg_ratio: float):
+    """
+    Scale learning-rate values (single value or list/tuple of values) by reg_ratio.
+    Leaves non-numeric values unchanged.
+    """
+    if value is None:
+        return None
+
+    def _scale(v):
+        if isinstance(v, (int, float)):
+            return v * reg_ratio
+        if isinstance(v, str):
+            try:
+                return float(v) * reg_ratio
+            except ValueError:
+                return v
+        return v
+
+    if isinstance(value, (list, tuple)):
+        return [_scale(v) for v in value]
+
+    return _scale(value)
+
+def merge_model_config(default_config: dict, model_config: dict) -> dict:
+    """Merge default config with model-specific overrides."""
+    merged = {}
+
+    if isinstance(default_config, dict):
+        merged.update(default_config)
+
+    if isinstance(model_config, dict):
+        merged.update(model_config)
+
+    return merged if merged else None
+
+def get_config_for_model(lrs_config: dict, model_name: str) -> dict:
+    """Get configuration overrides based on model name."""
+    if not isinstance(lrs_config, dict):
+        return None
+
+    data = lrs_config.get("data")
+    default_config = lrs_config.get("default", {})
+
+    if isinstance(data, dict) and model_name in data:
+        return merge_model_config(default_config, data.get(model_name))
+
+    if default_config:
+        return default_config
+
+    return None
+
+def hash_model(model: str) -> str:
+    model_bytes = model.encode('utf-8')
+    hashed = hashlib.sha256(model_bytes).hexdigest()
+    return hashed 
+
+def load_lrs_config(model_type: str, is_style: bool) -> dict:
+    """Load the appropriate LRS configuration based on model type and training type"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_dir = os.path.join(script_dir, "lrs")
+
+    if model_type == "flux":
+        config_file = os.path.join(config_dir, "flux.json")
+    elif is_style:
+        config_file = os.path.join(config_dir, "style_config.json")
+    else:
+        config_file = os.path.join(config_dir, "person_config.json")
+    
+    try:
+        with open(config_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load LRS config from {config_file}: {e}", flush=True)
+        return None
+
+def get_image_training_config_template_path(task_id: str, model_name: str, model_type: str, train_data_dir: str) -> tuple[str, bool]:
+    model_type = model_type.lower()
+
+    model_name = model_name.replace("Helloworld", "")
+    model_name = model_name.replace("helloworld", "")
+
+    config_file = ""
+    is_config = False 
+    is_new = False
+
+    if model_type == ImageModelType.SDXL.value:
+        prompts_path = os.path.join(train_data_dir, "5_lora style")
+        print(f"prompts_path: {prompts_path}")
+        prompts = []
+        for file in os.listdir(prompts_path):
+            if file.endswith(".txt"):
+                with open(os.path.join(prompts_path, file), "r") as f:
+                    prompt = f.read().strip()
+                    print(f"prompt: {prompt}")
+                    prompts.append(prompt)
+
+        styles = detect_styles_in_prompts(prompts)
+        print(f"Styles: {styles}")
+
+        if styles:
+            is_config = True
+            try:
+                config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_sdxl_style_{styles[0][0].split(' ', 1)[0].lower()}.toml"
+                print(f"config_file0: {config_file}")
+                if os.path.exists(config_file):
+                    print(f"Config: {config_file}")
+                    is_config = True
+                    # return config_file, True
+                else:
+                    config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_sdxl_style_{styles[1][0].split(' ', 1)[0].lower()}.toml"
+                    print(f"config_file1: {config_file}")
+                    if os.path.exists(config_file):
+                        print(f"Config: {config_file}")
+                        is_config = True
+                        # return config_file, True
+                    else:
+                        config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_sdxl_style_{styles[2][0].split(' ', 1)[0].lower()}.toml"
+                        print(f"config_file2: {config_file}")
+                        if os.path.exists(config_file):
+                            print(f"Config: {config_file}")
+                            is_config = True
+                            # return config_file, True
+                        else:
+                            print(f"Config: base_diffusion_sdxl_style.toml")
+                            config_file = str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_style.toml")
+                            is_config = True
+                            is_new = True
+                            # return str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_style.toml"), True
+            except:
+                print(f"Config: base_diffusion_sdxl_style.toml")
+                config_file = str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_style.toml")
+                is_config = True
+                is_new = True
+                # return str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_style.toml"), True
+
+        else:
+            is_config = False
+            config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_sdxl_person_{model_name.split('/', 1)[1]}.toml"
+            print(f"config_file_person1: {config_file}")
+            if os.path.exists(config_file):
+                print(f"Config: {config_file}")
+                is_config = False
+                # return config_file, True
+            else:
+                config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_sdxl_person_{model_name.split('/', 1)[0]}.toml"
+                print(f"config_file_person0: {config_file}")
+                if os.path.exists(config_file):
+                    print(f"Config: {config_file}")
+                    is_config = False
+                    # return config_file, True
+                else:
+                    print(f"Config: base_diffusion_sdxl_person.toml")
+                    config_file = str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_person.toml")
+                    is_config = False
+                    is_new = True
+                    # return str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_person.toml"), False
+
+    elif model_type == ImageModelType.FLUX.value:
+        is_config = False
+        config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_flux_{model_name.split('/', 1)[1]}.toml"
+        print(f"config_file_flux1: {config_file}")
+        if os.path.exists(config_file):
+            print(f"Config: {config_file}")
+            is_config = False
+            # return config_file, True
+        else:
+            config_file = f"{Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH)}/archives/base_diffusion_flux_{model_name.split('/', 1)[0]}.toml"
+            print(f"config_file_flux0: {config_file}")
+            if os.path.exists(config_file):
+                print(f"Config: {config_file}")
+                is_config = False
+                # return config_file, True
+            else:
+                print(f"Config: base_diffusion_flux.toml")
+                config_file = str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_flux.toml")
+                is_config = False
+                is_new = True
+                # return str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_flux.toml"), False
+
+    if is_new:
+        with open(config_file, "r") as file:
+            config = toml.load(file)
+
+        # Load and apply LRS configuration
+        lrs_config = load_lrs_config(model_type, is_config)
+        reg_ratio = 1
+        if lrs_config:
+            model_hash = hash_model(model_name)
+            lrs_settings = get_config_for_model(lrs_config, model_hash)
+
+            if lrs_settings:
+                base_unet_lr = lrs_settings.get('unet_lr')
+                base_text_encoder_lr = lrs_settings.get('text_encoder_lr')
+
+                final_unet_lr = base_unet_lr * reg_ratio if base_unet_lr else None
+                final_text_encoder_lr = apply_reg_ratio_to_lr(base_text_encoder_lr, reg_ratio)
+
+                print(f"Applying LRS configuration for model '{model_name}' (hash: {model_hash}):", flush=True)
+                print(f"  - Base unet_lr: {base_unet_lr} × reg_ratio: {reg_ratio} = {final_unet_lr}", flush=True)
+                print(f"  - Base text_encoder_lr: {base_text_encoder_lr} × reg_ratio: {reg_ratio} = {final_text_encoder_lr}", flush=True)
+                print(f"  - train_batch_size: {lrs_settings.get('train_batch_size')}", flush=True)
+                print(f"  - gradient_accumulation_steps: {lrs_settings.get('gradient_accumulation_steps')}", flush=True)
+                print(f"  - min_snr_gamma: {lrs_settings.get('min_snr_gamma')}", flush=True)
+                print(f"  - lr_warmup_steps: {lrs_settings.get('lr_warmup_steps')}", flush=True)
+                print(f"  - max_grad_norm: {lrs_settings.get('max_grad_norm')}", flush=True)
+                print(f"  - max_train_epochs: {lrs_settings.get('max_train_epochs')}", flush=True)
+                print(f"  - network_alpha: {lrs_settings.get('network_alpha')}", flush=True)
+                print(f"  - network_dim: {lrs_settings.get('network_dim')}", flush=True)
+                print(f"  - network_args: {lrs_settings.get('network_args')}", flush=True)
+                print(f"  - max_train_steps: {lrs_settings.get('max_train_steps')}", flush=True)
+
+
+                if final_unet_lr is not None:
+                    config['unet_lr'] = final_unet_lr
+                if final_text_encoder_lr is not None:
+                    config['text_encoder_lr'] = final_text_encoder_lr
+                if lrs_settings.get('train_batch_size') is not None:
+                    config['train_batch_size'] = lrs_settings.get('train_batch_size')
+                if lrs_settings.get('gradient_accumulation_steps') is not None:
+                    config['gradient_accumulation_steps'] = lrs_settings.get('gradient_accumulation_steps')
+                if lrs_settings.get('min_snr_gamma') is not None:
+                    config['min_snr_gamma'] = lrs_settings.get('min_snr_gamma')
+                if lrs_settings.get('lr_warmup_steps') is not None:
+                    config['lr_warmup_steps'] = lrs_settings.get('lr_warmup_steps')
+                if lrs_settings.get('max_grad_norm') is not None:
+                    config['max_grad_norm'] = lrs_settings.get('max_grad_norm')
+                if lrs_settings.get('max_train_epochs') is not None:
+                    config['max_train_epochs'] = lrs_settings.get('max_train_epochs')
+                if lrs_settings.get('network_alpha') is not None:
+                    config['network_alpha'] = lrs_settings.get('network_alpha')
+                if lrs_settings.get('network_dim') is not None:
+                    config['network_dim'] = lrs_settings.get('network_dim')
+                if lrs_settings.get('network_args') is not None:
+                    config['network_args'] = lrs_settings.get('network_args')
+                if lrs_settings.get('max_train_steps') is not None:
+                    config['max_train_steps'] = lrs_settings.get('max_train_steps')
+
+                config['resolution'] = "1024,1024"
+                config['save_every_n_epochs'] = 3
+
+                for optional_key in [
+                    "train_batch_size",
+                    "max_data_loader_n_workers",
+                    "optimizer_args",
+                    "min_snr_gamma",
+                    "prior_loss_weight",
+                    "max_grad_norm",
+                    "network_alpha",
+                    "network_dim",
+                    "network_args",
+                ]:
+                    if optional_key in lrs_settings:
+                        config[optional_key] = lrs_settings[optional_key]
+            else:
+                print(f"Warning: No LRS configuration found for model '{model_name}'", flush=True)
+        else:
+            print("Warning: Could not load LRS configuration, using default values", flush=True)
+
+        # Save config to file
+        config_file = os.path.join(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, f"{task_id}.toml")
+        save_config_toml(config, config_file)
+        print(f"Update config at {config_file}", flush=True)
+        print(f"Config: {config_file}")
+
+    return config_file, is_config
+
+def get_model_path(path: str) -> str:
+    if os.path.isdir(path):
+        files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+        if len(files) == 1 and files[0].endswith(".safetensors"):
+            return os.path.join(path, files[0])
+    return path
+
+def create_config(task_id, model_path, model_name, model_type, expected_repo_name):
+    """Get the training data directory"""
+    train_data_dir = train_paths.get_image_training_images_dir(task_id)
+
+    """Create the diffusion config file"""
+    config_template_path, is_style = get_image_training_config_template_path(task_id, model_name, model_type, train_data_dir)
+
+    with open(config_template_path, "r") as file:
+        config = toml.load(file)
+
+    # Update config
+    network_config_person = {
+        "stabilityai/stable-diffusion-xl-base-1.0": 235,
+        "Lykon/dreamshaper-xl-1-0": 235,
+        "Lykon/art-diffusion-xl-0.9": 235,
+        "SG161222/RealVisXL_V4.0": 467,
+        "stablediffusionapi/protovision-xl-v6.6": 235,
+        "stablediffusionapi/omnium-sdxl": 235,
+        "GraydientPlatformAPI/realism-engine2-xl": 235,
+        "GraydientPlatformAPI/albedobase2-xl": 467,
+        "KBlueLeaf/Kohaku-XL-Zeta": 235,
+        "John6666/hassaku-xl-illustrious-v10style-sdxl": 228,
+        "John6666/nova-anime-xl-pony-v5-sdxl": 235,
+        "cagliostrolab/animagine-xl-4.0": 699,
+        "dataautogpt3/CALAMITY": 235,
+        "dataautogpt3/ProteusSigma": 235,
+        "dataautogpt3/ProteusV0.5": 467,
+        "dataautogpt3/TempestV0.1": 456,
+        "ehristoforu/Visionix-alpha": 235,
+        "femboysLover/RealisticStockPhoto-fp16": 467,
+        "fluently/Fluently-XL-Final": 228,
+        "mann-e/Mann-E_Dreams": 456,
+        "misri/leosamsHelloworldXL_helloworldXL70": 235,
+        "misri/zavychromaxl_v90": 235,
+        "openart-custom/DynaVisionXL": 228,
+        "recoilme/colorfulxl": 228,
+        "zenless-lab/sdxl-aam-xl-anime-mix": 456,
+        "zenless-lab/sdxl-anima-pencil-xl-v5": 228,
+        "zenless-lab/sdxl-anything-xl": 228,
+        "zenless-lab/sdxl-blue-pencil-xl-v7": 467,
+        "Corcelio/mobius": 228,
+        "GHArt/Lah_Mysterious_SDXL_V4.0_xl_fp16": 235,
+        "OnomaAIResearch/Illustrious-xl-early-release-v0": 228
+    }
+
+    network_config_style = {
+        "stabilityai/stable-diffusion-xl-base-1.0": 235,
+        "Lykon/dreamshaper-xl-1-0": 235,
+        "Lykon/art-diffusion-xl-0.9": 235,
+        "SG161222/RealVisXL_V4.0": 235,
+        "stablediffusionapi/protovision-xl-v6.6": 235,
+        "stablediffusionapi/omnium-sdxl": 235,
+        "GraydientPlatformAPI/realism-engine2-xl": 235,
+        "GraydientPlatformAPI/albedobase2-xl": 235,
+        "KBlueLeaf/Kohaku-XL-Zeta": 235,
+        "John6666/hassaku-xl-illustrious-v10style-sdxl": 235,
+        "John6666/nova-anime-xl-pony-v5-sdxl": 235,
+        "cagliostrolab/animagine-xl-4.0": 235,
+        "dataautogpt3/CALAMITY": 235,
+        "dataautogpt3/ProteusSigma": 235,
+        "dataautogpt3/ProteusV0.5": 235,
+        "dataautogpt3/TempestV0.1": 228,
+        "ehristoforu/Visionix-alpha": 235,
+        "femboysLover/RealisticStockPhoto-fp16": 235,
+        "fluently/Fluently-XL-Final": 235,
+        "mann-e/Mann-E_Dreams": 235,
+        "misri/leosamsHelloworldXL_helloworldXL70": 235,
+        "misri/zavychromaxl_v90": 235,
+        "openart-custom/DynaVisionXL": 235,
+        "recoilme/colorfulxl": 235,
+        "zenless-lab/sdxl-aam-xl-anime-mix": 235,
+        "zenless-lab/sdxl-anima-pencil-xl-v5": 235,
+        "zenless-lab/sdxl-anything-xl": 235,
+        "zenless-lab/sdxl-blue-pencil-xl-v7": 235,
+        "Corcelio/mobius": 235,
+        "GHArt/Lah_Mysterious_SDXL_V4.0_xl_fp16": 235,
+        "OnomaAIResearch/Illustrious-xl-early-release-v0": 235
+    }
+
+    config_mapping = {
+        228: {
+            "network_dim": 32,
+            "network_alpha": 32,
+            "network_args": []
+        },
+        235: {
+            "network_dim": 32,
+            "network_alpha": 32,
+            "network_args": ["conv_dim=4", "conv_alpha=4", "dropout=null"]
+        },
+        456: {
+            "network_dim": 64,
+            "network_alpha": 64,
+            "network_args": []
+        },
+        467: {
+            "network_dim": 64,
+            "network_alpha": 64,
+            "network_args": ["conv_dim=4", "conv_alpha=4", "dropout=null"]
+        },
+        699: {
+            "network_dim": 96,
+            "network_alpha": 96,
+            "network_args": ["conv_dim=4", "conv_alpha=4", "dropout=null"]
+        },
+    }
+
+    config["pretrained_model_name_or_path"] = model_path
+    config["train_data_dir"] = train_data_dir
+    output_dir = train_paths.get_checkpoints_output_path(task_id, expected_repo_name)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    config["output_dir"] = output_dir
+
+    if model_type == "sdxl":
+        if is_style:
+            network_config = config_mapping[network_config_style[model_name]]
+        else:
+            network_config = config_mapping[network_config_person[model_name]]
+
+        config["network_dim"] = network_config["network_dim"]
+        config["network_alpha"] = network_config["network_alpha"]
+        config["network_args"] = network_config["network_args"]
+
+    # Save config to file
+    config_path = os.path.join(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, f"{task_id}.toml")
+    save_config_toml(config, config_path)
+    print(f"Created config at {config_path}", flush=True)
+    return config_path
+
+
+def run_training(model_type, config_path):
+    print(f"Starting training with config: {config_path}", flush=True)
+
+    if model_type == "sdxl":
+        training_command = [
+            "accelerate", "launch",
+            "--dynamo_backend", "no",
+            "--dynamo_mode", "default",
+            "--mixed_precision", "bf16",
+            "--num_processes", "1",
+            "--num_machines", "1",
+            "--num_cpu_threads_per_process", "2",
+            f"/app/sd-script/{model_type}_train_network.py",
+            "--config_file", config_path
+        ]
+    elif model_type == "flux":
+        training_command = [
+            "accelerate", "launch",
+            "--dynamo_backend", "no",
+            "--dynamo_mode", "default",
+            "--mixed_precision", "bf16",
+            "--num_processes", "1",
+            "--num_machines", "1",
+            "--num_cpu_threads_per_process", "2",
+            f"/app/sd-scripts/{model_type}_train_network.py",
+            "--config_file", config_path
+        ]
+
+    try:
+        print("Starting training subprocess...\n", flush=True)
+        process = subprocess.Popen(
+            training_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        for line in process.stdout:
+            print(line, end="", flush=True)
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, training_command)
+
+        print("Training subprocess completed successfully.", flush=True)
+
+    except subprocess.CalledProcessError as e:
+        print("Training subprocess failed!", flush=True)
+        print(f"Exit Code: {e.returncode}", flush=True)
+        print(f"Command: {' '.join(e.cmd) if isinstance(e.cmd, list) else e.cmd}", flush=True)
+        raise RuntimeError(f"Training subprocess failed with exit code {e.returncode}")
+
+
+async def main():
+    print("---STARTING IMAGE TRAINING SCRIPT---", flush=True)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Image Model Training Script")
+    parser.add_argument("--task-id", required=True, help="Task ID")
+    parser.add_argument("--model", required=True, help="Model name or path")
+    parser.add_argument("--dataset-zip", required=True, help="Link to dataset zip file")
+    parser.add_argument("--model-type", required=True, choices=["sdxl", "flux"], help="Model type")
+    parser.add_argument("--expected-repo-name", help="Expected repository name")
+    parser.add_argument("--hours-to-complete", type=float, required=True, help="Number of hours to complete the task")
+    args = parser.parse_args()
+
+    os.makedirs(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, exist_ok=True)
+    os.makedirs(train_cst.IMAGE_CONTAINER_IMAGES_PATH, exist_ok=True)
+
+    model_path = train_paths.get_image_base_model_path(args.model)
+
+    # Prepare dataset
+    print("Preparing dataset...", flush=True)
+
+    prepare_dataset(
+        training_images_zip_path=train_paths.get_image_training_zip_save_path(args.task_id),
+        training_images_repeat=cst.DIFFUSION_SDXL_REPEATS if args.model_type == ImageModelType.SDXL.value else cst.DIFFUSION_FLUX_REPEATS,
+        instance_prompt=cst.DIFFUSION_DEFAULT_INSTANCE_PROMPT,
+        class_prompt=cst.DIFFUSION_DEFAULT_CLASS_PROMPT,
+        job_id=args.task_id,
+        output_dir=train_cst.IMAGE_CONTAINER_IMAGES_PATH
+    )
+
+    # Create config file
+    config_path = create_config(
+        args.task_id,
+        model_path,
+        args.model,
+        args.model_type,
+        args.expected_repo_name, 
+    )
+
+    # Run training
+    run_training(args.model_type, config_path)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
